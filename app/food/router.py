@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from app.food.schemas import LotCreate, RiskDecision, SampleCreate, ShipmentCreate, TemperatureRecord, TestResultCreate
+from app.food.schemas import LotCreate, RiskDecision, RevokeRequest, SampleCreate, ShipmentCreate, TemperatureRecord, TestResultCreate
 from app.food.service import FoodService
 
 router = APIRouter(prefix="/api/food", tags=["食品安全"])
@@ -87,3 +87,23 @@ def decide_risk(lot_id: int, payload: RiskDecision):
         return service().decide_risk(lot_id, payload.model_dump())
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="批次不存在") from exc
+
+
+@router.post("/results/{result_id}/revoke", status_code=200)
+def revoke_result(result_id: int, payload: RevokeRequest):
+    try:
+        return service().revoke_result(result_id, payload.reason, payload.operator)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="检测结果不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/temperatures/{temperature_id}/revoke", status_code=200)
+def revoke_temperature(temperature_id: int, payload: RevokeRequest):
+    try:
+        return service().revoke_temperature(temperature_id, payload.reason, payload.operator)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="温度记录不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc

@@ -60,3 +60,8 @@ class RiskDecision(BaseModel):
     reason: str = Field(..., min_length=1, max_length=300)
     operator: str = Field(..., min_length=1, max_length=80)
 
+
+class RevokeRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=300)
+    operator: str = Field(default="监管员", min_length=1, max_length=80)
+

@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS food_test_results (
     certificate_no TEXT NOT NULL DEFAULT '',
     verdict TEXT NOT NULL CHECK(verdict IN ('pass','fail')),
     result_hash TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)),
+    revoked_at TEXT NOT NULL DEFAULT '',
+    revoke_reason TEXT NOT NULL DEFAULT '',
+    revoked_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     UNIQUE(sample_id, analyte, method, tested_at)
 );
@@ -75,6 +79,10 @@ CREATE TABLE IF NOT EXISTS food_temperatures (
     temperature_c REAL NOT NULL,
     source TEXT NOT NULL,
     in_range INTEGER NOT NULL CHECK(in_range IN (0,1)),
+    revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)),
+    revoked_at TEXT NOT NULL DEFAULT '',
+    revoke_reason TEXT NOT NULL DEFAULT '',
+    revoked_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     UNIQUE(shipment_id, recorded_at)
 );
@@ -106,8 +114,34 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+_REVOKE_COLUMNS = {
+    "food_test_results": [
+        ("revoked", "INTEGER NOT NULL DEFAULT 0"),
+        ("revoked_at", "TEXT NOT NULL DEFAULT ''"),
+        ("revoke_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("revoked_by", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "food_temperatures": [
+        ("revoked", "INTEGER NOT NULL DEFAULT 0"),
+        ("revoked_at", "TEXT NOT NULL DEFAULT ''"),
+        ("revoke_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("revoked_by", "TEXT NOT NULL DEFAULT ''"),
+    ],
+}
+
+
+def _migrate_revoke_columns(connection: sqlite3.Connection) -> None:
+    for table, columns in _REVOKE_COLUMNS.items():
+        existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        for name, declaration in columns:
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 def ensure_schema() -> None:
-    get_connection().executescript(SCHEMA)
+    connection = get_connection()
+    connection.executescript(SCHEMA)
+    _migrate_revoke_columns(connection)
 
 
 def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -210,6 +244,49 @@ class FoodService:
             if not in_range:
                 connection.execute("UPDATE food_shipments SET status='delayed',updated_at=? WHERE id=? AND status IN ('planned','in_transit')", (now, shipment_id))
             return _dict(connection.execute("SELECT * FROM food_temperatures WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+
+    def revoke_result(self, result_id: int, reason: str, operator: str = "监管员") -> dict[str, Any]:
+        """撤销检测证书：保留原始记录，联动所有引用它的投诉证据快照进入复查。"""
+        from app.food.complaints.service import ensure_schema as ensure_complaint_schema, propagate_source_revocation
+
+        with transaction(immediate=True) as connection:
+            row = connection.execute("SELECT * FROM food_test_results WHERE id=?", (result_id,)).fetchone()
+            if row is None:
+                raise KeyError("result_not_found")
+            if row["revoked"]:
+                raise ValueError("already_revoked")
+            now = _now()
+            connection.execute(
+                "UPDATE food_test_results SET revoked=1, revoked_at=?, revoke_reason=?, revoked_by=? WHERE id=?",
+                (now, reason, operator, result_id),
+            )
+            ensure_complaint_schema()
+            affected = propagate_source_revocation(connection, "certificate", result_id, reason, operator)
+            sample = connection.execute("SELECT lot_id FROM food_samples WHERE id=?", (row["sample_id"],)).fetchone()
+            lot_id = sample["lot_id"] if sample else None
+            connection.execute("INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)",
+                               (lot_id, "certificate.revoke", operator,
+                                json.dumps({"result_id": result_id, "reason": reason, "affected_complaints": affected}, ensure_ascii=False), now))
+            return dict(connection.execute("SELECT * FROM food_test_results WHERE id=?", (result_id,)).fetchone())
+
+    def revoke_temperature(self, temperature_id: int, reason: str, operator: str = "监管员") -> dict[str, Any]:
+        """撤销温度记录：保留原始记录，联动所有引用它的投诉证据快照进入复查。"""
+        from app.food.complaints.service import ensure_schema as ensure_complaint_schema, propagate_source_revocation
+
+        with transaction(immediate=True) as connection:
+            row = connection.execute("SELECT * FROM food_temperatures WHERE id=?", (temperature_id,)).fetchone()
+            if row is None:
+                raise KeyError("temperature_not_found")
+            if row["revoked"]:
+                raise ValueError("already_revoked")
+            now = _now()
+            connection.execute(
+                "UPDATE food_temperatures SET revoked=1, revoked_at=?, revoke_reason=?, revoked_by=? WHERE id=?",
+                (now, reason, operator, temperature_id),
+            )
+            ensure_complaint_schema()
+            propagate_source_revocation(connection, "temperature", temperature_id, reason, operator)
+            return dict(connection.execute("SELECT * FROM food_temperatures WHERE id=?", (temperature_id,)).fetchone())
 
     def decide_risk(self, lot_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         with transaction(immediate=True) as connection:
