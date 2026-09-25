@@ -86,6 +86,7 @@ app/
   repositories/    SQLite 查询与持久化读取
   routers/         灾情、事件、公告、部门和信访业务接口
   food/             农产品、检测、运输和风险处置服务
+  complaints/       食品投诉登记、证据快照引用、分派限时处置与结案复核
   schemas/         管理接口输入模型
   services/        身份、审计和后台任务领域服务
   cli.py           初始化、检查和冒烟入口
@@ -97,3 +98,19 @@ tools/             本地维护脚本
 ## 数据一致性
 
 SQLite 连接默认启用外键、WAL、busy timeout 与同步写入策略。需要跨多张表更新的管理操作在即时事务中执行，失败会整体回滚。会话令牌只保存摘要；用户停用会撤销仍有效的会话。审计事件保存操作者、动作、资源、结果和前后状态，但不会保存明文密码或令牌。
+
+## 食品投诉处置
+
+投诉以独立记录登记（投诉编号、联系人姓名/电话、涉事食堂、事发时间、关联批次与配送单）。投诉状态机为：
+
+`registered 已登记 → assigned 已分派 → processing 处置中 → reviewing 待复核 → closed 已结案`；处置中可进入 `supplementing 待补充材料` 后再回到处置中；复核退回或结案后证据被撤销进入 `reopened 复查重办`；重复投诉进入 `merged 已合并`。
+
+核心规则：
+
+- **证据快照**：引用检测证书、温度/配送记录、批次时，当场把来源数据（含嵌套样品、批次、温度点序列）固化为 JSON 快照并计算 SHA-256 哈希。批次随后被召回或状态变更不影响投诉持有的原始证据。
+- **撤销保留 + 复查标记**：证书或温度记录被撤销时不删除快照，证据置为 `revoked`、`needs_review=1` 并进入复查队列；若投诉已结案则自动重开（`reopened`，累计重开次数）。
+- **合并不吞记录**：重复投诉合并后状态为 `merged` 并指向主投诉，但各自的联系人、联系方式、时间线和材料保留在原记录上，主投诉列出全部独立联系人；已合并投诉只读。
+- **补充材料**：区分 `request`（责任人发起）与 `submission`（投诉人/食堂提交），全程入时间线。
+- **查询视图**：列表与详情返回当前责任人（`assignee`）、剩余时限（`remaining_hours`，负值即超期；结案后为 null）、证据完整度（批次/证书/温度三类齐全为 100 分，撤销证据不计分且单列待复查数）和结案理由（`close_reason`，重开后仍可查）。
+
+接口前缀 `/api/food/complaints`：登记 `POST /`、列表（支持 `status`、`assignee`、`lot_id`、`overdue_only`、`include_merged` 过滤）`GET /`、详情（含证据、材料、时间线、主/从投诉关系）`GET /{id}`、引用证据 `POST /{id}/evidence`、撤销 `POST /{id}/evidence/{eid}/revoke`、复查销记 `POST /{id}/evidence/{eid}/review`、分派 `POST /{id}/assign`、开始处置 `POST /{id}/start`、要求补充材料 `POST /{id}/supplement-request`、提交补充材料 `POST /{id}/supplements`、提交结案 `POST /{id}/submit`、结案复核 `POST /{id}/review`、合并重复投诉 `POST /{id}/merge`。
